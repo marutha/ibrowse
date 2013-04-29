@@ -15,7 +15,9 @@
 %% External exports
 -export([
          start_link/1,
+         start_link/2,
          start/1,
+         start/2,
          stop/1,
          send_req/7
         ]).
@@ -79,10 +81,16 @@
 %% Description: Starts the server
 %%--------------------------------------------------------------------
 start(Args) ->
-    gen_server:start(?MODULE, Args, []).
+    start(Args, []).
+
+start(Args, Options) ->
+    gen_server:start(?MODULE, Args, Options).
 
 start_link(Args) ->
-    gen_server:start_link(?MODULE, Args, []).
+    start_link(Args, []).
+
+start_link(Args, Options) ->
+    gen_server:start_link(?MODULE, Args, Options).
 
 stop(Conn_pid) ->
     case catch gen_server:call(Conn_pid, stop) of
@@ -562,13 +570,13 @@ do_send_body(Body, State, _TE) ->
 
 do_send_body1(Source, Resp, State, TE) ->
     case Resp of
-		{ok, Data} when Data == []; Data == <<>> ->
-			do_send_body({Source}, State, TE);
+                {ok, Data} when Data == []; Data == <<>> ->
+                        do_send_body({Source}, State, TE);
         {ok, Data} ->
             do_send(maybe_chunked_encode(Data, TE), State),
             do_send_body({Source}, State, TE);
-		{ok, Data, New_source_state} when Data == []; Data == <<>> ->
-			do_send_body({Source, New_source_state}, State, TE);
+                {ok, Data, New_source_state} when Data == []; Data == <<>> ->
+                        do_send_body({Source, New_source_state}, State, TE);
         {ok, Data, New_source_state} ->
             do_send(maybe_chunked_encode(Data, TE), State),
             do_send_body({Source, New_source_state}, State, TE);
@@ -994,8 +1002,12 @@ chunk_request_body(Body, _ChunkSize, Acc) when is_list(Body) ->
     lists:reverse(["\r\n", LastChunk, Chunk | Acc]).
 
 
-parse_response(_Data, #state{cur_req = undefined}=State) ->
+parse_response(<<>>, #state{cur_req = undefined}=State) ->
     State#state{status = idle};
+parse_response(Data, #state{cur_req = undefined}) ->
+    do_trace("Data left to process when no pending request. ~1000.p~n", [Data]),
+    {error, data_in_status_idle};
+
 parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
                             cur_req = CurReq} = State) ->
     #request{from=From, stream_to=StreamTo, req_id=ReqId,
@@ -1012,48 +1024,50 @@ parse_response(Data, #state{reply_buffer = Acc, reqs = Reqs,
             LCHeaders = [{to_lower(X), Y} || {X,Y} <- Headers_1],
             ConnClose = to_lower(get_value("connection", LCHeaders, "false")),
             IsClosing = is_connection_closing(HttpVsn, ConnClose),
-            case IsClosing of
-                true ->
-                    shutting_down(State);
-                false ->
-                    ok
-            end,
+            State_0 = case IsClosing of
+                          true ->
+                              shutting_down(State),
+                              State#state{is_closing = IsClosing};
+                          false ->
+                              State
+                      end,
             Give_raw_headers = get_value(give_raw_headers, Options, false),
             State_1 = case Give_raw_headers of
                           true ->
-                              State#state{recvd_headers=Headers_1, status=get_body,
-                                          reply_buffer = <<>>,
-                                          status_line = Status_line,
-                                          raw_headers = Raw_headers,
-                                          http_status_code=StatCode, is_closing=IsClosing};
+                              State_0#state{recvd_headers=Headers_1, status=get_body,
+                                            reply_buffer = <<>>,
+                                            status_line = Status_line,
+                                            raw_headers = Raw_headers,
+                                            http_status_code=StatCode};
                           false ->
-                              State#state{recvd_headers=Headers_1, status=get_body,
-                                          reply_buffer = <<>>,
-                                          http_status_code=StatCode, is_closing=IsClosing}
+                              State_0#state{recvd_headers=Headers_1, status=get_body,
+                                            reply_buffer = <<>>,
+                                            http_status_code=StatCode}
                       end,
             put(conn_close, ConnClose),
             TransferEncoding = to_lower(get_value("transfer-encoding", LCHeaders, "false")),
+            Head_response_with_body = lists:member({workaround, head_response_with_body}, Options),
             case get_value("content-length", LCHeaders, undefined) of
                 _ when Method == connect,
                        hd(StatCode) == $2 ->
                     {_, Reqs_1} = queue:out(Reqs),
                     cancel_timer(T_ref),
-                    upgrade_to_ssl(set_cur_request(State#state{reqs = Reqs_1,
-                                                               recvd_headers = [],
-                                                               status = idle
-                                                              }));
+                    upgrade_to_ssl(set_cur_request(State_0#state{reqs = Reqs_1,
+                                                                 recvd_headers = [],
+                                                                 status = idle
+                                                                }));
                 _ when Method == connect ->
                     {_, Reqs_1} = queue:out(Reqs),
                     do_error_reply(State#state{reqs = Reqs_1},
                                    {error, proxy_tunnel_failed}),
                     {error, proxy_tunnel_failed};
-                _ when Method == head,
-                       TransferEncoding =/= "chunked" ->
-                    %% This is not supposed to happen, but it does. An
-                    %% Apache server was observed to send an "empty"
-                    %% body, but in a Chunked-Transfer-Encoding way,
-                    %% which meant there was still a body.
-                    %% Issue #67 on Github
+                _ when Method =:= head,
+                       Head_response_with_body =:= false ->
+                    %% This (HEAD response with body) is not supposed
+                    %% to happen, but it does. An Apache server was
+                    %% observed to send an "empty" body, but in a
+                    %% Chunked-Transfer-Encoding way, which meant
+                    %% there was still a body.  Issue #67 on Github
                     {_, Reqs_1} = queue:out(Reqs),
                     send_async_headers(ReqId, StreamTo, Give_raw_headers, State_1),
                     State_1_1 = do_reply(State_1, From, StreamTo, ReqId, Resp_format,
@@ -1556,6 +1570,7 @@ get_crlf_pos(<<>>, _)                     -> no.
 fmt_val(L) when is_list(L)    -> L;
 fmt_val(I) when is_integer(I) -> integer_to_list(I);
 fmt_val(A) when is_atom(A)    -> atom_to_list(A);
+fmt_val(B) when is_binary(B)    -> B;
 fmt_val(Term)                 -> io_lib:format("~p", [Term]).
 
 crnl() -> "\r\n".
@@ -1821,8 +1836,11 @@ inc_pipeline_counter(#state{lb_ets_tid = undefined} = State) ->
     State;
 inc_pipeline_counter(#state{cur_pipeline_size = Pipe_sz,
                            lb_ets_tid = Tid} = State) ->
-    ets:update_counter(Tid, self(), {2,1,99999,9999}),
+    update_counter(Tid, self(), {2,1,99999,9999}),
     State#state{cur_pipeline_size = Pipe_sz + 1}.
+
+update_counter(Tid, Key, Args) ->
+    ets:update_counter(Tid, Key, Args).
 
 dec_pipeline_counter(#state{is_closing = true} = State) ->
     State;
@@ -1831,8 +1849,8 @@ dec_pipeline_counter(#state{lb_ets_tid = undefined} = State) ->
 dec_pipeline_counter(#state{cur_pipeline_size = Pipe_sz,
                             lb_ets_tid = Tid} = State) ->
     try
-        ets:update_counter(Tid, self(), {2,-1,0,0}),
-        ets:update_counter(Tid, self(), {3,-1,0,0})
+        update_counter(Tid, self(), {2,-1,0,0}),
+        update_counter(Tid, self(), {3,-1,0,0})
     catch
         _:_ ->
             ok
